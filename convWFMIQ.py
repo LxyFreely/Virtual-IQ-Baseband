@@ -25,8 +25,8 @@ def generate_mpx_signal(left_channel, right_channel, sample_rate=192000, skip_no
         b = [1, -pre_emphasis_alpha]
         a = [1]
         # 对左右声道分别进行预加重
-        left_channel = lfilter(b, a, left_channel)*1.4
-        right_channel = lfilter(b, a, right_channel)*1.4
+        left_channel = lfilter(b, a, left_channel)
+        right_channel = lfilter(b, a, right_channel)
         print(f"✅ 已对左右声道应用预加重 (alpha={pre_emphasis_alpha:.2f})")
     
     l_plus_r = left_channel + right_channel
@@ -34,7 +34,7 @@ def generate_mpx_signal(left_channel, right_channel, sample_rate=192000, skip_no
     
     # DC去除 (现在在预加重之后)
     nyquist = 0.5 * sample_rate
-    cutoff_dc = 0.1 / nyquist
+    cutoff_dc = 10 / nyquist
     b_dc, a_dc = signal.butter(1, cutoff_dc, btype='high')
     l_plus_r = signal.filtfilt(b_dc, a_dc, l_plus_r)
     l_minus_r = signal.filtfilt(b_dc, a_dc, l_minus_r)
@@ -52,25 +52,33 @@ def generate_mpx_signal(left_channel, right_channel, sample_rate=192000, skip_no
     t = np.arange(len(l_plus_r)) / sample_rate
     
     # ✅ 固定导频振幅 (0.1) - 与音频无关
-    pilot = 0.1 * np.sin(2 * np.pi * 19000 * t)
+    pilot = 0.07 * np.sin(2 * np.pi * 19000 * t)#提高音频信号比，标准为0.1，给音频信号留电平
     
     carrier_freq = 38000  # 标准38kHz载波
     carrier = np.cos(2 * np.pi * carrier_freq * t)
     
     l_minus_r_modulated = l_minus_r_filtered * carrier
     
-    if no_pilot:
-        mpx_signal = l_plus_r_filtered + l_minus_r_modulated
-    else:
-        mpx_signal = l_plus_r_filtered + l_minus_r_modulated + pilot
+    mpx_signal = l_plus_r_filtered + l_minus_r_modulated
+
+    #第一次归一化拉满电平
+    #if not skip_normalization:
+    #    safe_factor = 1
+    #    max_abs = np.max(np.abs(mpx_signal))
+    #    mpx_signal = mpx_signal * (safe_factor / max_abs)
     
-    # ✅ 安全归一化 (0.85)
+    #乘1.2然后softclip到[-1,1]
+    #mpx_signal = np.tanh(mpx_signal * 1.5)
+
+    if not no_pilot:
+        mpx_signal = mpx_signal + pilot
+    
+    # 第二次归一化
     if not skip_normalization:
-        safe_factor = 0.85
+        safe_factor = 1
         max_abs = np.max(np.abs(mpx_signal))
-        if max_abs > safe_factor:
-            mpx_signal = mpx_signal * (safe_factor / max_abs)
-    
+        mpx_signal = mpx_signal * (safe_factor / max_abs)
+
     return mpx_signal
 
 def convert_to_sdr_baseband(input_file, output_file, target_sample_rate=240000, bit_depth=16, no_fm=False, skip_normalization=False, pre_emphasis_alpha=0.901, no_pilot=False, superHF=0):
@@ -123,10 +131,10 @@ def convert_to_sdr_baseband(input_file, output_file, target_sample_rate=240000, 
         baseband_q = np.zeros_like(mpx_signal_resampled)
     else:
         print("FM调制 (基带表示)...")
-        t = np.arange(len(mpx_signal_resampled)) / (target_sample_rate*10)
+        t = np.arange(len(mpx_signal_resampled)) / (target_sample_rate)
         
         # ✅ 关键修复1: 正确实现FM调制公式
-        fc=100000     #载波频率，由于精度原因，在0上算不出精确数值
+        fc=10000     #载波频率，由于精度原因，在0上算不出精确数值
         k_f = 75000  # 标准FM频偏 (75kHz)
 
 
@@ -136,7 +144,7 @@ def convert_to_sdr_baseband(input_file, output_file, target_sample_rate=240000, 
         #方法1：正常方法
         #phase = 2 * np.pi * k_f * np.cumsum(mpx_signal_resampled) / target_sample_rate
         print("计算相位...")
-        phase = 2 * np.pi * fc * t + 2 * np.pi * k_f * np.cumsum(mpx_signal_resampled) / (target_sample_rate*10)
+        #phase = 2 * np.pi * fc * t + 2 * np.pi * k_f * np.cumsum(mpx_signal_resampled) / (target_sample_rate)
 
 
         #方法2：递归法
@@ -156,8 +164,13 @@ def convert_to_sdr_baseband(input_file, output_file, target_sample_rate=240000, 
                 phase[i] += 2 * np.pi
         
         '''
+        phase_increment=2 * np.pi * k_f * mpx_signal_resampled / target_sample_rate
 
+        phase=np.cumsum(phase_increment ,dtype=np.float64)
 
+        phase=phase+2*np.pi*fc*t
+
+        #phase=np.mod(phase,2*np.pi)
 
 
 
@@ -226,7 +239,7 @@ def convert_to_sdr_baseband(input_file, output_file, target_sample_rate=240000, 
     print(f"输出文件: {output_file}")
     print(f"参数: {target_sample_rate}Hz, {bit_depth}bit, 2声道 (I/Q)")
     print(f"FM调制: {'启用' if not no_fm else '禁用'}")
-    print(f"归一化: {'安全缩放到0.85' if not skip_normalization else '跳过归一化'}")
+    print(f"归一化: {'缩放到1' if not skip_normalization else '跳过归一化'}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='将立体声音频转换为SDR WFM测试用基带信号')
