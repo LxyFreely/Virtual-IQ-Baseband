@@ -8,10 +8,28 @@ import soundfile as sf
 import argparse
 from scipy.signal import lfilter
 from tqdm import tqdm
+from numba import njit
+
+@njit(fastmath=False,cache=True)
+def kahan_cumsum_numba(arr):
+    n=len(arr)
+    result=np.zeros(n, dtype=np.float64)
+    sum_val=0.0
+    c=0.0
+
+    for i in range(n):
+        y=arr[i]-c
+        t=sum_val+y
+        c=(t-sum_val)-y
+        sum_val=t
+        result[i]=sum_val
+
+    return result
+
 
 def generate_mpx_signal(left_channel, right_channel, sample_rate=192000, skip_normalization=False, pre_emphasis_alpha=0.901,no_pilot=False, superHF=0):
     """
-    生成MPX信号，预加重放在DC去除之前（正确位置）
+    生成MPX信号
     参数:
     left_channel: 左声道信号
     right_channel: 右声道信号
@@ -19,7 +37,17 @@ def generate_mpx_signal(left_channel, right_channel, sample_rate=192000, skip_no
     skip_normalization: 是否跳过归一化 (用于调试)
     pre_emphasis_alpha: 预加重系数 (0-1, 默认0.901)
     """
-    # ✅ 关键修复: 预加重放在DC去除之前 (正确位置)
+
+    # DC去除
+    nyquist = 0.5 * sample_rate
+    cutoff_dc = 20 / nyquist #低切频率20Hz
+    b_dc, a_dc = signal.butter(1, cutoff_dc, btype='high')
+    left_channel = signal.filtfilt(b_dc, a_dc, left_channel)
+    right_channel = signal.filtfilt(b_dc, a_dc, right_channel)
+    print(f"DC去除")
+
+
+    # 预加重
     if pre_emphasis_alpha is not None and 0 < pre_emphasis_alpha < 1:
         # 创建FIR滤波器系数 [1, -alpha]
         b = [1, -pre_emphasis_alpha]
@@ -27,17 +55,15 @@ def generate_mpx_signal(left_channel, right_channel, sample_rate=192000, skip_no
         # 对左右声道分别进行预加重
         left_channel = lfilter(b, a, left_channel)
         right_channel = lfilter(b, a, right_channel)
-        print(f"✅ 已对左右声道应用预加重 (alpha={pre_emphasis_alpha:.2f})")
+        print(f"预加重 (alpha={pre_emphasis_alpha:.2f})")
+
     
+
     l_plus_r = left_channel + right_channel
     l_minus_r = left_channel - right_channel
-    
-    # DC去除 (现在在预加重之后)
-    nyquist = 0.5 * sample_rate
-    cutoff_dc = 10 / nyquist
-    b_dc, a_dc = signal.butter(1, cutoff_dc, btype='high')
-    l_plus_r = signal.filtfilt(b_dc, a_dc, l_plus_r)
-    l_minus_r = signal.filtfilt(b_dc, a_dc, l_minus_r)
+    print(f"计算midside信号")
+
+
     
     # 低通滤波 (截止15kHz)
     if not superHF==2:
@@ -48,11 +74,14 @@ def generate_mpx_signal(left_channel, right_channel, sample_rate=192000, skip_no
         b, a = signal.butter(5, cutoff, btype='low')
         l_plus_r_filtered = signal.filtfilt(b, a, l_plus_r)
         l_minus_r_filtered = signal.filtfilt(b, a, l_minus_r)
+        print(f"低通滤波 (截止{cutoff*nyquist:.0f}Hz)")
+    
     
     t = np.arange(len(l_plus_r)) / sample_rate
     
     # ✅ 固定导频振幅 (0.1) - 与音频无关
-    pilot = 0.07 * np.sin(2 * np.pi * 19000 * t)#提高音频信号比，标准为0.1，给音频信号留电平
+    pilot = 0.1 * np.sin(2 * np.pi * 19000 * t)#提高音频信号比，标准为0.1，给音频信号留电平(测试过了因为信噪比在这即使不按照规范来也能用)
+    print(f"计算导频")
     
     carrier_freq = 38000  # 标准38kHz载波
     carrier = np.cos(2 * np.pi * carrier_freq * t)
@@ -60,12 +89,10 @@ def generate_mpx_signal(left_channel, right_channel, sample_rate=192000, skip_no
     l_minus_r_modulated = l_minus_r_filtered * carrier
     
     mpx_signal = l_plus_r_filtered + l_minus_r_modulated
-
-    #第一次归一化拉满电平
-    #if not skip_normalization:
-    #    safe_factor = 1
-    #    max_abs = np.max(np.abs(mpx_signal))
-    #    mpx_signal = mpx_signal * (safe_factor / max_abs)
+    #第一次归一化拉满电平（归一化因子选择从大到小排序第若干项忽略尖峰）
+    max_abs = np.sort(np.abs(mpx_signal))[::-1][20000]
+    mpx_signal = mpx_signal / max_abs
+    print(f"第一次归一化拉满电平 (归一化因子={max_abs:.2f})")
     
     #乘1.2然后softclip到[-1,1]
     #mpx_signal = np.tanh(mpx_signal * 1.5)
@@ -76,8 +103,9 @@ def generate_mpx_signal(left_channel, right_channel, sample_rate=192000, skip_no
     # 第二次归一化
     if not skip_normalization:
         safe_factor = 1
-        max_abs = np.max(np.abs(mpx_signal))
+        max_abs = np.sort(np.abs(mpx_signal))[::-1][5000]*safe_factor
         mpx_signal = mpx_signal * (safe_factor / max_abs)
+        print(f"第二次归一化 (归一化因子={safe_factor:.2f})")
 
     return mpx_signal
 
@@ -103,7 +131,7 @@ def convert_to_sdr_baseband(input_file, output_file, target_sample_rate=240000, 
         print(f"⚠️ 输入音频采样率 {sample_rate} Hz 不是标准的192kHz，正在重采样到192kHz...")
         data = signal.resample_poly(data, 192000, sample_rate)
         sample_rate = 192000
-        print(f"✅ 已重采样到标准192kHz采样率")
+        print(f"已重采样到标准192kHz采样率")
     
     if len(data.shape) == 1 or data.shape[1] != 2:
         raise ValueError("输入音频必须是立体声 (2声道)")
@@ -130,11 +158,11 @@ def convert_to_sdr_baseband(input_file, output_file, target_sample_rate=240000, 
         baseband_i = mpx_signal_resampled
         baseband_q = np.zeros_like(mpx_signal_resampled)
     else:
-        print("FM调制 (基带表示)...")
+        print("FM调制...")
         t = np.arange(len(mpx_signal_resampled)) / (target_sample_rate)
         
         # ✅ 关键修复1: 正确实现FM调制公式
-        fc=10000     #载波频率，由于精度原因，在0上算不出精确数值
+        fc=100     #载波频率，由于精度原因，在0上算不出精确数值
         k_f = 75000  # 标准FM频偏 (75kHz)
 
 
@@ -165,12 +193,16 @@ def convert_to_sdr_baseband(input_file, output_file, target_sample_rate=240000, 
         
         '''
         phase_increment=2 * np.pi * k_f * mpx_signal_resampled / target_sample_rate
+        print("计算相位差")
 
-        phase=np.cumsum(phase_increment ,dtype=np.float64)
+        phase=kahan_cumsum_numba(phase_increment)
+        print("积分")
 
         phase=phase+2*np.pi*fc*t
+        print("添加载波相位")
 
-        #phase=np.mod(phase,2*np.pi)
+        phase=np.mod(phase,2*np.pi)
+        print("相位取模")
 
 
 
@@ -188,6 +220,7 @@ def convert_to_sdr_baseband(input_file, output_file, target_sample_rate=240000, 
 
         baseband_i=np.cos(phase)
         baseband_q=np.sin(phase)
+        print("生成基带I/Q信号")
 
         #print("低通滤波...")
         #nyquist = 0.5 * target_sample_rate
@@ -200,13 +233,12 @@ def convert_to_sdr_baseband(input_file, output_file, target_sample_rate=240000, 
         #baseband_i = baseband_i_filtered
         #baseband_q = baseband_q_filtered
     
+    #重采样回来
+    #baseband_i = signal.resample_poly(baseband_i, target_sample_rate, target_sample_rate*10)
+    #baseband_q = signal.resample_poly(baseband_q, target_sample_rate, target_sample_rate*10)
     # 确保信号在-1到1范围内
     #baseband_i = np.clip(baseband_i, -1, 1)
     #baseband_q = np.clip(baseband_q, -1, 1)
-    #重采样回目标采样率
-    #print(f"重采样回目标采样率 {target_sample_rate} Hz...")
-    #baseband_i = signal.resample_poly(baseband_i, target_sample_rate, target_sample_rate*10)
-    #baseband_q = signal.resample_poly(baseband_q, target_sample_rate, target_sample_rate*10)
     
     if bit_depth == 8:
         # 8位使用无符号整数 (0-255)
