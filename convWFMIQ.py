@@ -335,7 +335,7 @@ if __name__ == "__main__":
     parser.add_argument('--pre-emphasis-alpha', type=float, default=0.901, help='预加重系数 (0-1, 默认 0.901)')
     parser.add_argument('--no-pilot', action='store_true', help='是否不添加导频信号 (默认 False)')
     parser.add_argument('--superHF', type=int, default=0, choices=[0, 1, 2], help='低通滤波档位:0:15k, 1:18k, 2:不滤波')
-    parser.add_argument('--fc', type=float, default=100, help='载波频率 (默认 100Hz)')
+    parser.add_argument('--fc', type=float, default=1000, help='载波频率 (默认 100Hz)')
     parser.add_argument('--k-f', type=float, default=75000, help='FM 频率偏移 (默认 75kHz)')
     parser.add_argument('--lpbyresamp', action='store_true', help='是否通过重采样来实现低通制造混叠味 (默认 False)')
     parser.add_argument('--tanh', action='store_true', help='是否对 mpx 使用 tanh 模拟过载 (默认 False)')
