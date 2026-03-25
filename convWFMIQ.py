@@ -26,8 +26,61 @@ def kahan_cumsum_numba(arr):
 
     return result
 
+@njit(fastmath=False,cache=True)
+def fm_modulator_complex_high_prec(mpx,fc,k_f,target_sample_rate):
+    n_samples=len(mpx)
+    baseband_i=np.zeros(n_samples, dtype=np.float64)
+    baseband_q=np.zeros(n_samples, dtype=np.float64)
+    vec_real=1.0
+    vec_imag=0.0
 
-def generate_mpx_signal(left_channel, right_channel, sample_rate=192000, skip_normalization=False, pre_emphasis_alpha=0.901,no_pilot=False, superHF=0):
+    for i in range(n_samples):
+        total_angle=2*np.pi*(k_f*mpx[i]+fc)/target_sample_rate
+        rot_cos=np.cos(total_angle)
+        rot_sin=np.sin(total_angle)
+        new_real=vec_real*rot_cos-vec_imag*rot_sin
+        new_imag=vec_real*rot_sin+vec_imag*rot_cos
+        if i%100==0:
+            mag=np.sqrt(new_real**2+new_imag**2)
+            vec_real=new_real/mag
+            vec_imag=new_imag/mag
+        else:
+            vec_real=new_real
+            vec_imag=new_imag
+        baseband_i[i]=vec_real
+        baseband_q[i]=vec_imag
+    return baseband_i,baseband_q
+
+def lowpass_fir(audio,sample_rate,cutoff_freq=15000,numtaps=201,window='hamming'):
+    nyquist = 0.5 * sample_rate
+    normalized_cutoff = cutoff_freq / nyquist
+    if numtaps%2==0:
+        numtaps+=1
+    if window=='kaiser':
+        coeffs=signal.firwin(numtaps,normalized_cutoff,window=('kaiser',8.0))
+    else:
+        coeffs=signal.firwin(numtaps,normalized_cutoff,window=window)
+    padlen=3*(numtaps-1)
+    if len(audio)<=padlen:
+        raise ValueError(f"音频长度不足，需要{padlen}个样本")
+    filtered=signal.filtfilt(coeffs,[1],audio,padlen=padlen)
+    return filtered
+
+def lowcut_fir(audio,sample_rate,cutoff_freq=20,numtaps=1601,window='hamming'):
+    nyquist = 0.5 * sample_rate
+    normalized_cutoff = cutoff_freq / nyquist
+    if numtaps%2==0:
+        numtaps+=1
+    if window=='kaiser':
+        coeffs=signal.firwin(numtaps,normalized_cutoff,window=('kaiser',8.0),pass_zero=False)
+    else:
+        coeffs=signal.firwin(numtaps,normalized_cutoff,window=window,pass_zero=False)
+    padlen=3*(numtaps-1)
+    if len(audio)<=padlen:
+        raise ValueError(f"音频长度不足，需要{padlen}个样本")
+    filtered=signal.filtfilt(coeffs,[1],audio,padlen=padlen)
+    return filtered
+def generate_mpx_signal(left_channel, right_channel, sample_rate=192000, skip_normalization=False, pre_emphasis_alpha=0.901,no_pilot=False, superHF=0, lpbyresamp=False, tanh=False,):
     """
     生成MPX信号
     参数:
@@ -39,49 +92,76 @@ def generate_mpx_signal(left_channel, right_channel, sample_rate=192000, skip_no
     """
 
     # DC去除
+    print(f"DC去除")
     nyquist = 0.5 * sample_rate
-    cutoff_dc = 20 / nyquist #低切频率20Hz
-    b_dc, a_dc = signal.butter(1, cutoff_dc, btype='high')
+    cutoff_dc = 20 #低切频率20Hz
+    numtaps=801
+    b_dc, a_dc = signal.butter(1, cutoff_dc / nyquist, btype='high')
     left_channel = signal.filtfilt(b_dc, a_dc, left_channel)
     right_channel = signal.filtfilt(b_dc, a_dc, right_channel)
-    print(f"DC去除")
+    print("已用butter初步去除，开始fir滤波器滤波")
+    left_channel = lowcut_fir(left_channel,sample_rate,cutoff_freq=cutoff_dc,numtaps=numtaps)
+    right_channel = lowcut_fir(right_channel,sample_rate,cutoff_freq=cutoff_dc,numtaps=numtaps)
+    print(f"已用fir滤波器滤波 (截止{cutoff_dc:.0f}Hz, {numtaps}个系数)")
+    
 
 
     # 预加重
     if pre_emphasis_alpha is not None and 0 < pre_emphasis_alpha < 1:
+        print(f"预加重 (alpha={pre_emphasis_alpha:.2f})")
         # 创建FIR滤波器系数 [1, -alpha]
         b = [1, -pre_emphasis_alpha]
         a = [1]
         # 对左右声道分别进行预加重
         left_channel = lfilter(b, a, left_channel)
         right_channel = lfilter(b, a, right_channel)
-        print(f"预加重 (alpha={pre_emphasis_alpha:.2f})")
-
+        
+    if tanh:
+        print(f"对mpx使用tanh模拟过载")
+        max_abs=np.max((np.abs(left_channel),np.abs(right_channel)))
+        left_channel/=max_abs
+        right_channel/=max_abs
+        print(f"tanh前归一化已完成（归一化因子={max_abs:.2f}）")
+        left_channel = np.tanh(left_channel)
+        right_channel = np.tanh(right_channel)
+        print('已完成tanh模拟过载')
     
-
+    print(f"计算midside信号")
     l_plus_r = left_channel + right_channel
     l_minus_r = left_channel - right_channel
-    print(f"计算midside信号")
+    
+    
+    # 低通滤波 (截止15kHz)
+    if not superHF==1:
+        cutoff=18000
+        numtaps=151
+    elif not superHF==0:
+        cutoff = 15000
+        numtaps=301
+    if  lpbyresamp:
+        print("采用重采样进行低通滤波")
+        #比如15k截止频率就重采样到30k再重采样回192k
+        target_sample_rate = cutoff*2
+        l_plus_r_filtered = signal.resample_poly(l_plus_r, target_sample_rate, sample_rate)
+        l_minus_r_filtered = signal.resample_poly(l_minus_r, target_sample_rate, sample_rate)
+        l_plus_r_filtered = signal.resample_poly(l_plus_r_filtered, sample_rate, target_sample_rate)
+        l_minus_r_filtered = signal.resample_poly(l_minus_r_filtered, sample_rate, target_sample_rate)
+        print(f"已通过重采样低通滤波(截止{cutoff:.0f}Hz,通过{target_sample_rate:.0f}Hz采样)")
+    print("正常采用fir进行滤波")
+    l_plus_r_filtered = lowpass_fir(l_plus_r,sample_rate,cutoff_freq=cutoff,numtaps=numtaps)
+    l_minus_r_filtered = lowpass_fir(l_minus_r,sample_rate,cutoff_freq=cutoff,numtaps=numtaps)
+    print(f"已低通滤波 (截止{cutoff:.0f}Hz, {numtaps}个系数)")
+
 
 
     
-    # 低通滤波 (截止15kHz)
-    if not superHF==2:
-        if superHF ==1:
-            cutoff=18000 / nyquist
-        elif superHF ==0:
-            cutoff = 15000 / nyquist
-        b, a = signal.butter(5, cutoff, btype='low')
-        l_plus_r_filtered = signal.filtfilt(b, a, l_plus_r)
-        l_minus_r_filtered = signal.filtfilt(b, a, l_minus_r)
-        print(f"低通滤波 (截止{cutoff*nyquist:.0f}Hz)")
     
     
     t = np.arange(len(l_plus_r)) / sample_rate
     
     # ✅ 固定导频振幅 (0.1) - 与音频无关
-    pilot = 0.1 * np.sin(2 * np.pi * 19000 * t)#提高音频信号比，标准为0.1，给音频信号留电平(测试过了因为信噪比在这即使不按照规范来也能用)
     print(f"计算导频")
+    pilot = 0.1 * np.sin(2 * np.pi * 19000 * t)#提高音频信号比，标准为0.1，给音频信号留电平(测试过了因为信噪比在这即使不按照规范来也能用)
     
     carrier_freq = 38000  # 标准38kHz载波
     carrier = np.cos(2 * np.pi * carrier_freq * t)
@@ -90,9 +170,12 @@ def generate_mpx_signal(left_channel, right_channel, sample_rate=192000, skip_no
     
     mpx_signal = l_plus_r_filtered + l_minus_r_modulated
     #第一次归一化拉满电平（归一化因子选择从大到小排序第若干项忽略尖峰）
-    max_abs = np.sort(np.abs(mpx_signal))[::-1][20000]
-    mpx_signal = mpx_signal / max_abs
-    print(f"第一次归一化拉满电平 (归一化因子={max_abs:.2f})")
+    if not skip_normalization:
+        print(f"第一次归一化拉满电平")
+        max_abs = np.sort(np.abs(mpx_signal))[::-1][20000]
+        mpx_signal = mpx_signal / max_abs
+        print(f"第一次归一化完成 (归一化因子={max_abs:.2f})")
+    
     
     #乘1.2然后softclip到[-1,1]
     #mpx_signal = np.tanh(mpx_signal * 1.5)
@@ -102,14 +185,28 @@ def generate_mpx_signal(left_channel, right_channel, sample_rate=192000, skip_no
     
     # 第二次归一化
     if not skip_normalization:
+        print(f"第二次归一化")
         safe_factor = 1
         max_abs = np.sort(np.abs(mpx_signal))[::-1][5000]*safe_factor
         mpx_signal = mpx_signal * (safe_factor / max_abs)
-        print(f"第二次归一化 (归一化因子={safe_factor:.2f})")
+        print(f"第二次归一化完成 (归一化因子={safe_factor:.2f})")
 
     return mpx_signal
 
-def convert_to_sdr_baseband(input_file, output_file, target_sample_rate=240000, bit_depth=16, no_fm=False, skip_normalization=False, pre_emphasis_alpha=0.901, no_pilot=False, superHF=0):
+def convert_to_sdr_baseband(input_file, output_file, 
+                            target_sample_rate=240000, 
+                            bit_depth=16, 
+                            no_fm=False, 
+                            skip_normalization=False, 
+                            pre_emphasis_alpha=0.901, 
+                            no_pilot=False, 
+                            superHF=0, 
+                            fc=1000000, 
+                            k_f=75000, 
+                            lpbyresamp=False, 
+                            tanh=False, 
+                            iqtanh=False,
+                            FM_function=0):
     """
     将立体声音频转换为SDR WFM测试用基带信号
     参数:
@@ -147,7 +244,9 @@ def convert_to_sdr_baseband(input_file, output_file, target_sample_rate=240000, 
         skip_normalization=skip_normalization,
         pre_emphasis_alpha=pre_emphasis_alpha,
         no_pilot=no_pilot,
-        superHF=superHF
+        superHF=superHF,
+        lpbyresamp=lpbyresamp,
+        tanh=tanh,
     )
     
     print(f"重采样到 {target_sample_rate} Hz...")
@@ -162,49 +261,33 @@ def convert_to_sdr_baseband(input_file, output_file, target_sample_rate=240000, 
         t = np.arange(len(mpx_signal_resampled)) / (target_sample_rate)
         
         # ✅ 关键修复1: 正确实现FM调制公式
-        fc=100     #载波频率，由于精度原因，在0上算不出精确数值
-        k_f = 75000  # 标准FM频偏 (75kHz)
+        fc=fc     #载波频率，由于精度原因，在0上算不出精确数值
+        k_f = k_f  # 标准FM频偏 (75kHz)
+        if FM_function==0:
+            print("使用公式直接运算")
+            phase_increment=2 * np.pi * k_f * mpx_signal_resampled / target_sample_rate
+            print("计算相位差")
+            phase=kahan_cumsum_numba(phase_increment)
+            print("积分")
+            phase=phase+2*np.pi*fc*t
+            print("添加载波相位")
+            phase=np.mod(phase,2*np.pi)
+            print("相位取模")
+            baseband_i=np.cos(phase)
+            baseband_q=np.sin(phase)
+            print("生成基带I/Q信号")
+        elif FM_function==1:
+            print("使用复数单位圆模拟法")
+            #模拟一个复数平面内旋转的单位向量，基于向量角度来直接运算向量，直接取xy作为iq信号
+            baseband_i,baseband_q=fm_modulator_complex_high_prec(mpx_signal_resampled,fc,k_f,target_sample_rate)
 
 
 
-
-
+        
         #方法1：正常方法
         #phase = 2 * np.pi * k_f * np.cumsum(mpx_signal_resampled) / target_sample_rate
         print("计算相位...")
         #phase = 2 * np.pi * fc * t + 2 * np.pi * k_f * np.cumsum(mpx_signal_resampled) / (target_sample_rate)
-
-
-        #方法2：递归法
-        '''
-        phase_increment = 2 * np.pi * k_f * mpx_signal_resampled / target_sample_rate
-         初始化相位
-        phase = np.zeros_like(mpx_signal_resampled)
-        phase[0] = 0  # 初始相位
-
-         递归计算相位，确保相位在[-π, π]范围内
-        for i in range(1, len(phase)):
-            phase[i] = phase[i-1] + phase_increment[i]
-            # 确保相位连续，避免数值误差
-            if phase[i] > np.pi:
-                phase[i] -= 2 * np.pi
-            elif phase[i] < -np.pi:
-                phase[i] += 2 * np.pi
-        
-        '''
-        phase_increment=2 * np.pi * k_f * mpx_signal_resampled / target_sample_rate
-        print("计算相位差")
-
-        phase=kahan_cumsum_numba(phase_increment)
-        print("积分")
-
-        phase=phase+2*np.pi*fc*t
-        print("添加载波相位")
-
-        phase=np.mod(phase,2*np.pi)
-        print("相位取模")
-
-
 
         #现在再下变频回0Hz
         #print("下变频回0Hz...")
@@ -218,9 +301,10 @@ def convert_to_sdr_baseband(input_file, output_file, target_sample_rate=240000, 
         #baseband_i = if_i * local_i + if_q * local_q
         #baseband_q = if_q * local_i - if_i * local_q
 
-        baseband_i=np.cos(phase)
-        baseband_q=np.sin(phase)
-        print("生成基带I/Q信号")
+        if iqtanh:
+            print(f"对iq信号使用tanh模拟过载")
+            baseband_i = np.tanh(baseband_i)
+            baseband_q = np.tanh(baseband_q)
 
         #print("低通滤波...")
         #nyquist = 0.5 * target_sample_rate
@@ -284,6 +368,12 @@ if __name__ == "__main__":
     parser.add_argument('--pre-emphasis-alpha', type=float, default=0.901, help='预加重系数 (0-1, 默认0.8) - 位置已修复且优化')
     parser.add_argument('--no-pilot', action='store_true', help='是否不添加导频信号 (默认False)')
     parser.add_argument('--superHF', type=int , default=0, choices=[0, 1, 2], help='低通滤波档位:0:15k, 1:18k, 2:不滤波')
+    parser.add_argument('--fc', type=float, default=100, help='载波频率 (默认100Hz)')
+    parser.add_argument('--k-f', type=float, default=75000, help='FM频率偏移 (默认75kHz)')
+    parser.add_argument('--lpbyresamp',action='store_true', help='是否通过重采样来实现低通制造混叠味 (默认False)')
+    parser.add_argument('--tanh',action='store_true', help='是否对mpx使用tanh模拟过载 (默认False)')
+    parser.add_argument('--iqtanh',action='store_true', help='是否对iq信号使用tanh (默认False)')
+    parser.add_argument('--FM_function', type=int, default=0,choices=[0,1], help='选择FM所用的方法:0:公式直接运算,1:复数单位圆模拟法')
     
     args = parser.parse_args()
     
@@ -296,5 +386,11 @@ if __name__ == "__main__":
         args.skip_normalization,
         args.pre_emphasis_alpha,
         args.no_pilot,
-        args.superHF
+        args.superHF,
+        args.fc,
+        args.k_f,
+        args.lpbyresamp,
+        args.tanh,
+        args.iqtanh,
+        args.FM_function,
     )
