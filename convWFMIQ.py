@@ -80,7 +80,7 @@ def lowcut_fir(audio,sample_rate,cutoff_freq=20,numtaps=1601,window='hamming'):
         raise ValueError(f"音频长度不足，需要{padlen}个样本")
     filtered=signal.filtfilt(coeffs,[1],audio,padlen=padlen)
     return filtered
-def generate_mpx_signal(left_channel, right_channel, sample_rate=192000, skip_normalization=False, pre_emphasis_alpha=0.901,no_pilot=False, superHF=0, lpbyresamp=False, tanh=False,):
+def generate_mpx_signal(left_channel, right_channel, sample_rate=192000, skip_normalization=False, pre_emphasis_alpha=0.901,no_pilot=False, superHF=0, lpbyresamp=False, tanh=False,strictDC=False):
     """
     生成MPX信号
     参数:
@@ -99,10 +99,11 @@ def generate_mpx_signal(left_channel, right_channel, sample_rate=192000, skip_no
     b_dc, a_dc = signal.butter(1, cutoff_dc / nyquist, btype='high')
     left_channel = signal.filtfilt(b_dc, a_dc, left_channel)
     right_channel = signal.filtfilt(b_dc, a_dc, right_channel)
-    print("已用butter初步去除，开始fir滤波器滤波")
-    left_channel = lowcut_fir(left_channel,sample_rate,cutoff_freq=cutoff_dc,numtaps=numtaps)
-    right_channel = lowcut_fir(right_channel,sample_rate,cutoff_freq=cutoff_dc,numtaps=numtaps)
-    print(f"已用fir滤波器滤波 (截止{cutoff_dc:.0f}Hz, {numtaps}个系数)")
+    print("已用butter初步去除")
+    if strictDC:
+        left_channel = lowcut_fir(left_channel,sample_rate,cutoff_freq=cutoff_dc,numtaps=numtaps)
+        right_channel = lowcut_fir(right_channel,sample_rate,cutoff_freq=cutoff_dc,numtaps=numtaps)
+        print(f"已用fir滤波器滤波 (截止{cutoff_dc:.0f}Hz, {numtaps}个系数)")
     
 
 
@@ -206,7 +207,9 @@ def convert_to_sdr_baseband(input_file, output_file,
                             lpbyresamp=False, 
                             tanh=False, 
                             iqtanh=False,
-                            FM_function=0):
+                            FM_function=0,
+                            strictDC=False
+                            ):
     """
     将立体声音频转换为SDR WFM测试用基带信号
     参数:
@@ -247,6 +250,7 @@ def convert_to_sdr_baseband(input_file, output_file,
         superHF=superHF,
         lpbyresamp=lpbyresamp,
         tanh=tanh,
+        strictDC=strictDC
     )
     
     print(f"重采样到 {target_sample_rate} Hz...")
@@ -286,7 +290,7 @@ def convert_to_sdr_baseband(input_file, output_file,
         
         #方法1：正常方法
         #phase = 2 * np.pi * k_f * np.cumsum(mpx_signal_resampled) / target_sample_rate
-        print("计算相位...")
+        #print("计算相位...")
         #phase = 2 * np.pi * fc * t + 2 * np.pi * k_f * np.cumsum(mpx_signal_resampled) / (target_sample_rate)
 
         #现在再下变频回0Hz
@@ -326,22 +330,21 @@ def convert_to_sdr_baseband(input_file, output_file,
     
     if bit_depth == 8:
         # 8位使用无符号整数 (0-255)
-        baseband_i_8bit = np.clip(baseband_i * 127 + 128, 0, 255).astype(np.uint8)
-        baseband_q_8bit = np.clip(baseband_q * 127 + 128, 0, 255).astype(np.uint8)
+        baseband_i_store = np.clip(baseband_i * 127 + 128, 0, 255).astype(np.uint8)
+        baseband_q_store = np.clip(baseband_q * 127 + 128, 0, 255).astype(np.uint8)
     elif bit_depth == 16:
         # 16位使用有符号整数 (-32768 to 32767)
-        baseband_i_16bit = np.clip(baseband_i * 32767, -32768, 32767).astype(np.int16)
-        baseband_q_16bit = np.clip(baseband_q * 32767, -32768, 32767).astype(np.int16)
+        baseband_i_store = np.clip(baseband_i * 32767, -32768, 32767).astype(np.int16)
+        baseband_q_store = np.clip(baseband_q * 32767, -32768, 32767).astype(np.int16)
+    elif bit_depth == 32:
+        #32位IEEE
+        baseband_i_store = baseband_i.astype(np.float32)
+        baseband_q_store = baseband_q.astype(np.float32)
     else:
-        raise ValueError("bit_depth必须是8或16")
+        raise ValueError("bit_depth必须是8,16,32位或32位")
     
     print("创建IQ信号...")
-    if bit_depth == 8:
-        iq_signal = np.column_stack((baseband_i_8bit, baseband_q_8bit))
-    else:  # bit_depth == 16
-        # 16位输出
-        iq_signal = np.column_stack((baseband_i_16bit, baseband_q_16bit))
-    
+    iq_signal = np.column_stack((baseband_i_store, baseband_q_store))
     print("保存为WAV文件...")
     with wave.open(output_file, 'wb') as wav_file:
         wav_file.setnchannels(2)
@@ -362,7 +365,7 @@ if __name__ == "__main__":
     parser.add_argument('input', help='输入音频文件路径 (立体声)')
     parser.add_argument('output', help='输出WAV文件路径')
     parser.add_argument('--sample-rate', type=int, default=240000, help='目标采样率 (标准2400000Hz)')
-    parser.add_argument('--bit-depth', type=int, choices=[8, 16], default=16, help='位深度 (8/16, 默认16)')
+    parser.add_argument('--bit-depth', type=int, choices=[8, 16, 32], default=16, help='位深度 (8/16/32IEEE, 默认16)')
     parser.add_argument('--no-fm', action='store_true', help='不进行FM调制，直接输出MPX信号')
     parser.add_argument('--skip-normalization', action='store_true', help='跳过MPX归一化 (仅用于调试)')
     parser.add_argument('--pre-emphasis-alpha', type=float, default=0.901, help='预加重系数 (0-1, 默认0.8) - 位置已修复且优化')
@@ -373,7 +376,8 @@ if __name__ == "__main__":
     parser.add_argument('--lpbyresamp',action='store_true', help='是否通过重采样来实现低通制造混叠味 (默认False)')
     parser.add_argument('--tanh',action='store_true', help='是否对mpx使用tanh模拟过载 (默认False)')
     parser.add_argument('--iqtanh',action='store_true', help='是否对iq信号使用tanh (默认False)')
-    parser.add_argument('--FM_function', type=int, default=0,choices=[0,1], help='选择FM所用的方法:0:公式直接运算,1:复数单位圆模拟法')
+    parser.add_argument('--fm-function', type=int, default=0,choices=[0,1], help='选择FM所用的方法:0:公式直接运算,1:复数单位圆模拟法')
+    parser.add_argument('--strictDC', action='store_true', help='是否启用fir滤波过滤DC (默认False)')
     
     args = parser.parse_args()
     
@@ -392,5 +396,6 @@ if __name__ == "__main__":
         args.lpbyresamp,
         args.tanh,
         args.iqtanh,
-        args.FM_function,
+        args.fm_function,
+        args.strictDC,
     )
